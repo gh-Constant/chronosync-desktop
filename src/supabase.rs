@@ -205,4 +205,22 @@ impl SupabaseClient {
         
         Ok(auth_url)
     }
+
+    pub async fn upload_icon(&self, file_path: &std::path::Path, file_name: &str) -> Result<()> {
+        let file_content = tokio::fs::read(file_path).await?;
+        
+        let response = self.client
+            .post(&format!("{}/storage/v1/object/app-icons/{}", self.url, file_name))
+            .header("Authorization", format!("Bearer {}", self.anon_key))
+            .body(file_content)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await?;
+            return Err(anyhow::anyhow!("Failed to upload icon: {}", error));
+        }
+
+        Ok(())
+    }
 } 

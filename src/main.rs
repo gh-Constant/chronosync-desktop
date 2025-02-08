@@ -1,4 +1,6 @@
 mod supabase;
+mod session_storage;
+mod icon_manager;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -34,6 +36,8 @@ use portpicker;
 use tiny_http;
 
 use crate::supabase::{Session, SupabaseClient, Provider};
+use crate::session_storage::SessionStorage;
+use crate::icon_manager::IconManager;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AppUsageData {
@@ -43,6 +47,7 @@ struct AppUsageData {
     time_in_foreground: u64,
     timestamp: DateTime<Utc>,
     os: String,
+    icon_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -56,6 +61,7 @@ struct ChronoSyncApp {
     error_message: Option<String>,
     login_tx: crossbeam_channel::Sender<LoginResult>,
     login_rx: crossbeam_channel::Receiver<LoginResult>,
+    session_storage: SessionStorage,
 }
 
 #[derive(Debug)]
@@ -81,6 +87,8 @@ struct WindowMonitor {
     last_window: Option<WindowInfo>,
     last_window_time: Instant,
     session: Option<Session>,
+    app_usage_times: std::collections::HashMap<String, u64>,
+    last_update_time: Instant,
 }
 
 impl WindowMonitor {
@@ -89,11 +97,18 @@ impl WindowMonitor {
             last_window: None,
             last_window_time: Instant::now(),
             session: None,
+            app_usage_times: std::collections::HashMap::new(),
+            last_update_time: Instant::now(),
         }
     }
 
     fn set_session(&mut self, session: Option<Session>) {
         self.session = session;
+        if let Some(session) = &self.session {
+            self.app_usage_times.clear();
+            self.last_update_time = Instant::now();
+        }
+
     }
 
     unsafe fn get_window_title(hwnd: HWND) -> Result<String> {
@@ -129,7 +144,7 @@ impl WindowMonitor {
         Ok(os_string.to_string_lossy().into_owned())
     }
 
-    fn check_active_window(&mut self) -> Option<AppUsageData> {
+    async fn check_active_window(&mut self) -> Option<AppUsageData> {
         if self.session.is_none() {
             return None;
         }
@@ -149,17 +164,41 @@ impl WindowMonitor {
                 package_name: package_name.clone(),
             };
 
-            // If window changed, create usage data
-            let usage_data = if let Some(last) = &self.last_window {
-                if last.hwnd != hwnd {
-                    let duration = self.last_window_time.elapsed();
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_update_time);
+
+            // Update time for current window
+            if let Some(ref last) = self.last_window {
+                if last.hwnd == hwnd {
+                    let total_time = self.app_usage_times
+                        .entry(package_name.clone())
+                        .or_insert(0);
+                    *total_time += elapsed.as_millis() as u64;
+                }
+            }
+
+            // Create usage data if window changed or enough time has passed
+            let usage_data = if let Some(ref last) = self.last_window {
+                if last.hwnd != hwnd || elapsed.as_secs() >= 5 {
+                    let total_time = *self.app_usage_times
+                        .get(&last.package_name)
+                        .unwrap_or(&0);
+
+                    // Try to extract and upload icon
+                    let icon_name = if let Ok(Some(name)) = IconManager::extract_and_upload_icon(&last.package_name).await {
+                        Some(name)
+                    } else {
+                        None
+                    };
+
                     Some(AppUsageData {
                         user_id: self.session.as_ref().unwrap().user_id,
                         package_name: last.package_name.clone(),
                         app_name: last.title.clone(),
-                        time_in_foreground: duration.as_millis() as u64,
+                        time_in_foreground: total_time,
                         timestamp: Utc::now(),
                         os: String::from("Windows"),
+                        icon_name,
                     })
                 } else {
                     None
@@ -170,7 +209,7 @@ impl WindowMonitor {
 
             // Update state
             self.last_window = Some(current_window);
-            self.last_window_time = Instant::now();
+            self.last_update_time = now;
 
             usage_data
         }
@@ -262,21 +301,31 @@ impl ChronoSyncApp {
 
         // Start window checking task
         thread::spawn(move || {
-            loop {
-                if let Some(usage_data) = monitor_clone.lock().check_active_window() {
-                    info!("Window changed: {:?}", usage_data);
-                    if let Err(e) = tx.send(usage_data) {
-                        error!("Failed to send usage data: {}", e);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                loop {
+                    if let Some(usage_data) = monitor_clone.lock().check_active_window().await {
+                        info!("Window changed: {:?}", usage_data);
+                        if let Err(e) = tx.send(usage_data) {
+                            error!("Failed to send usage data: {}", e);
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                thread::sleep(Duration::from_millis(500));
-            }
+            });
         });
 
         let (login_tx, login_rx) = bounded(1);
+        let session_storage = SessionStorage::new();
+        
+        // Try to load saved session
+        let session = session_storage.load_session().ok().flatten();
+        if let Some(session) = &session {
+            window_monitor.lock().set_session(Some(session.clone()));
+        }
 
         Self {
-            session: None,
+            session,
             last_window: None,
             last_window_time: Instant::now(),
             window_monitor,
@@ -285,6 +334,7 @@ impl ChronoSyncApp {
             error_message: None,
             login_tx,
             login_rx,
+            session_storage,
         }
     }
 
@@ -293,6 +343,7 @@ impl ChronoSyncApp {
         let password = self.login_password.clone();
         let window_monitor = self.window_monitor.clone();
         let login_tx = self.login_tx.clone();
+        let session_storage = self.session_storage.clone();
 
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -301,6 +352,9 @@ impl ChronoSyncApp {
                     match supabase.sign_in(&email, &password).await {
                         Ok(session) => {
                             window_monitor.lock().set_session(Some(session.clone()));
+                            if let Err(e) = session_storage.save_session(&session) {
+                                error!("Failed to save session: {}", e);
+                            }
                             LoginResult::Success(session)
                         },
                         Err(e) => LoginResult::Error(format!("Login failed: {}", e)),
@@ -316,6 +370,9 @@ impl ChronoSyncApp {
     fn handle_logout(&mut self) {
         self.session = None;
         self.window_monitor.lock().set_session(None);
+        if let Err(e) = self.session_storage.clear_session() {
+            error!("Failed to clear session: {}", e);
+        }
     }
 
     fn handle_oauth_login(&mut self, provider: Provider) {
