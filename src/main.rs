@@ -1,6 +1,7 @@
 mod supabase;
 mod session_storage;
 mod icon_manager;
+mod color_convert;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -47,7 +48,6 @@ struct AppUsageData {
     time_in_foreground: u64,
     timestamp: DateTime<Utc>,
     os: String,
-    icon_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -184,12 +184,12 @@ impl WindowMonitor {
                         .get(&last.package_name)
                         .unwrap_or(&0);
 
-                    // Try to extract and upload icon
-                    let icon_name = if let Ok(Some(name)) = IconManager::extract_and_upload_icon(&last.package_name).await {
-                        Some(name)
-                    } else {
-                        None
-                    };
+                    // Upload icon separately from usage data
+                    if let Ok(supabase) = crate::supabase::SupabaseClient::get() {
+                        if let Ok(Some(_)) = IconManager::extract_and_upload_icon(&last.package_name).await {
+                            info!("Icon uploaded successfully for {}", last.package_name);
+                        }
+                    }
 
                     Some(AppUsageData {
                         user_id: self.session.as_ref().unwrap().user_id,
@@ -198,7 +198,6 @@ impl WindowMonitor {
                         time_in_foreground: total_time,
                         timestamp: Utc::now(),
                         os: String::from("Windows"),
-                        icon_name,
                     })
                 } else {
                     None

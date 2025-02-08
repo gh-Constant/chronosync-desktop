@@ -207,20 +207,59 @@ impl SupabaseClient {
     }
 
     pub async fn upload_icon(&self, file_path: &std::path::Path, file_name: &str) -> Result<()> {
+        log::info!("Attempting to upload icon: {}", file_name);
+        
+        // First check if bucket exists and create it if not
+        let response = self.client
+            .post(&format!("{}/storage/v1/bucket", self.url))
+            .header("Authorization", format!("Bearer {}", self.anon_key))
+            .json(&serde_json::json!({
+                "id": "app-icons",
+                "name": "app-icons",
+                "public": true
+            }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await?;
+            log::warn!("Bucket creation response: {}", error);
+            // Ignore error as bucket might already exist
+        }
+
+        // Set bucket policy to public
+        let policy_response = self.client
+            .post(&format!("{}/storage/v1/bucket/app-icons/policy", self.url))
+            .header("Authorization", format!("Bearer {}", self.anon_key))
+            .json(&serde_json::json!({
+                "type": "public"
+            }))
+            .send()
+            .await?;
+
+        if !policy_response.status().is_success() {
+            let error = policy_response.text().await?;
+            log::warn!("Policy update response: {}", error);
+        }
+
         let file_content = tokio::fs::read(file_path).await?;
+        log::info!("Read file content, size: {} bytes", file_content.len());
         
         let response = self.client
             .post(&format!("{}/storage/v1/object/app-icons/{}", self.url, file_name))
             .header("Authorization", format!("Bearer {}", self.anon_key))
+            .header("Content-Type", "image/png")
             .body(file_content)
             .send()
             .await?;
 
         if !response.status().is_success() {
             let error = response.text().await?;
+            log::error!("Failed to upload icon: {}", error);
             return Err(anyhow::anyhow!("Failed to upload icon: {}", error));
         }
 
+        log::info!("Successfully uploaded icon: {}", file_name);
         Ok(())
     }
 } 
